@@ -27,6 +27,12 @@
 
 #include "nanosvg.h"
 
+#ifdef RGB565_PIXELS
+#define BPP 2
+#else // RGBA8888_PIXELS
+#define BPP 4
+#endif
+
 #ifndef NANOSVGRAST_CPLUSPLUS
 #ifdef __cplusplus
 extern "C" {
@@ -43,9 +49,9 @@ typedef struct NSVGrasterizer NSVGrasterizer;
 	// Create rasterizer (can be used to render multiple images).
 	struct NSVGrasterizer* rast = nsvgCreateRasterizer();
 	// Allocate memory for image
-	unsigned char* img = malloc(w*h*4);
+	unsigned char* img = malloc(w*h*BPP);
 	// Rasterize
-	nsvgRasterize(rast, image, 0,0,1, img, w, h, w*4);
+	nsvgRasterize(rast, image, 0,0,1, img, w, h, w*BPP);
 */
 
 // Allocated rasterizer context.
@@ -990,7 +996,7 @@ static inline int nsvg__div255(int x)
 static void nsvg__scanlineSolid(unsigned char* dst, int count, unsigned char* cover, int x, int y,
 								float tx, float ty, float scale, NSVGcachedPaint* cache)
 {
-
+#if BPP == 4
 	if (cache->type == NSVG_PAINT_COLOR) {
 		int i, cr, cg, cb, ca;
 		cr = cache->colors[0] & 0xff;
@@ -1113,6 +1119,144 @@ static void nsvg__scanlineSolid(unsigned char* dst, int count, unsigned char* co
 			fx += dx;
 		}
 	}
+#else // RGB565
+    uint16_t u16, *d16 = (uint16_t *)dst;
+    uint8_t r0, g0, b0;
+    
+    if (cache->type == NSVG_PAINT_COLOR) {
+        int i, cr, cg, cb, ca;
+        cr = cache->colors[0] & 0xff;
+        cg = (cache->colors[0] >> 8) & 0xff;
+        cb = (cache->colors[0] >> 16) & 0xff;
+        ca = (cache->colors[0] >> 24) & 0xff;
+       for (i = 0; i < count; i++) {
+           int r,g,b;
+           int a, ia;
+           if (cover[0] == 255) { // no need to mix an opaque color
+               u16 = ((cr & 0xf8) << 8);
+               u16 |= ((cg & 0xfc) << 3);
+               u16 |= (cb >> 3);
+               d16[0] = u16;
+           } else { // more complex
+               // Premultiply
+               a = nsvg__div255((int)cover[0] * ca);
+               ia = 255 - a;
+               r = nsvg__div255(cr * a);
+               g = nsvg__div255(cg * a);
+               b = nsvg__div255(cb * a);
+               
+               // Blend over
+               u16 = d16[0];
+               r0 = (u16 >> 8) & 0xf8;
+               g0 = (u16 >> 3) & 0xfc;
+               b0 = (u16 << 3) & 0xf8;
+               r += nsvg__div255(ia * (int)r0);
+               g += nsvg__div255(ia * (int)g0);
+               b += nsvg__div255(ia * (int)b0);
+               u16 = (r & 0xf8) << 8;
+               u16 |= (g & 0xfc) << 3;
+               u16 |= (b >> 3);
+               d16[0] = u16;
+           }
+            cover++;
+            d16++;
+        }
+    } else if (cache->type == NSVG_PAINT_LINEAR_GRADIENT) {
+        // TODO: spread modes.
+        // TODO: plenty of opportunities to optimize.
+        float fx, fy, dx, gy;
+        float* t = cache->xform;
+        int i, cr, cg, cb, ca;
+        unsigned int c;
+
+        fx = ((float)x - tx) / scale;
+        fy = ((float)y - ty) / scale;
+        dx = 1.0f / scale;
+
+        for (i = 0; i < count; i++) {
+            int r,g,b,a,ia;
+            gy = fx*t[1] + fy*t[3] + t[5];
+            c = cache->colors[(int)nsvg__clampf(gy*255.0f, 0, 255.0f)];
+            cr = (c) & 0xff;
+            cg = (c >> 8) & 0xff;
+            cb = (c >> 16) & 0xff;
+            ca = (c >> 24) & 0xff;
+
+            a = nsvg__div255((int)cover[0] * ca);
+            ia = 255 - a;
+
+            // Premultiply
+            r = nsvg__div255(cr * a);
+            g = nsvg__div255(cg * a);
+            b = nsvg__div255(cb * a);
+
+            // Blend over
+            u16 = d16[0];
+            r0 = (u16 >> 8) & 0xf8;
+            g0 = (u16 >> 3) & 0xfc;
+            b0 = (u16 << 3) & 0xf8;
+            r += nsvg__div255(ia * (int)r0);
+            g += nsvg__div255(ia * (int)g0);
+            b += nsvg__div255(ia * (int)b0);
+            u16 = (r & 0xf8) << 8;
+            u16 |= (g & 0xfc) << 3;
+            u16 |= (b >> 3);
+            d16[0] = u16;
+
+            cover++;
+            d16++;
+            fx += dx;
+        }
+    } else if (cache->type == NSVG_PAINT_RADIAL_GRADIENT) {
+        // TODO: spread modes.
+        // TODO: plenty of opportunities to optimize.
+        // TODO: focus (fx,fy)
+        float fx, fy, dx, gx, gy, gd;
+        float* t = cache->xform;
+        int i, cr, cg, cb, ca;
+        unsigned int c;
+
+        fx = ((float)x - tx) / scale;
+        fy = ((float)y - ty) / scale;
+        dx = 1.0f / scale;
+
+        for (i = 0; i < count; i++) {
+            int r,g,b,a,ia;
+            gx = fx*t[0] + fy*t[2] + t[4];
+            gy = fx*t[1] + fy*t[3] + t[5];
+            gd = sqrtf(gx*gx + gy*gy);
+            c = cache->colors[(int)nsvg__clampf(gd*255.0f, 0, 255.0f)];
+            cr = (c) & 0xff;
+            cg = (c >> 8) & 0xff;
+            cb = (c >> 16) & 0xff;
+            ca = (c >> 24) & 0xff;
+
+            a = nsvg__div255((int)cover[0] * ca);
+            ia = 255 - a;
+
+            // Premultiply
+            r = nsvg__div255(cr * a);
+            g = nsvg__div255(cg * a);
+            b = nsvg__div255(cb * a);
+
+            // Blend over
+            u16 = d16[0];
+            r0 = (u16 >> 8) & 0xf8;
+            g0 = (u16 >> 3) & 0xfc;
+            b0 = (u16 << 3) & 0xf8;
+            r += nsvg__div255(ia * (int)r0);
+            g += nsvg__div255(ia * (int)g0);
+            b += nsvg__div255(ia * (int)b0);
+            u16 = (r & 0xf8) << 8;
+            u16 |= (g & 0xfc) << 3;
+            u16 |= (b >> 3);
+            d16[0] = u16;
+            cover++;
+            d16++;
+            fx += dx;
+        }
+    }
+#endif
 }
 
 static void nsvg__rasterizeSortedEdges(NSVGrasterizer *r, float tx, float ty, float scale, NSVGcachedPaint* cache, char fillRule)
@@ -1197,7 +1341,7 @@ static void nsvg__rasterizeSortedEdges(NSVGrasterizer *r, float tx, float ty, fl
 		if (xmin < 0) xmin = 0;
 		if (xmax > r->width-1) xmax = r->width-1;
 		if (xmin <= xmax) {
-			nsvg__scanlineSolid(&r->bitmap[y * r->stride] + xmin*4, xmax-xmin+1, &r->scanline[xmin], xmin, y, tx,ty, scale, cache);
+			nsvg__scanlineSolid(&r->bitmap[y * r->stride] + xmin*BPP, xmax-xmin+1, &r->scanline[xmin], xmin, y, tx,ty, scale, cache);
 		}
 	}
 
@@ -1205,6 +1349,7 @@ static void nsvg__rasterizeSortedEdges(NSVGrasterizer *r, float tx, float ty, fl
 
 static void nsvg__unpremultiplyAlpha(unsigned char* image, int w, int h, int stride)
 {
+#if BPP == 4
 	int x,y;
 
 	// Unpremultiply
@@ -1260,6 +1405,7 @@ static void nsvg__unpremultiplyAlpha(unsigned char* image, int w, int h, int str
 			row += 4;
 		}
 	}
+#endif // BPP == 4 only
 }
 
 
@@ -1387,7 +1533,7 @@ void nsvgRasterize(NSVGrasterizer* r,
 	}
 
 	for (i = 0; i < h; i++)
-		memset(&dst[i*stride], 0, w*4);
+		memset(&dst[i*stride], 0, stride);
 
 	for (shape = image->shapes; shape != NULL; shape = shape->next) {
 		if (!(shape->flags & NSVG_FLAGS_VISIBLE))
